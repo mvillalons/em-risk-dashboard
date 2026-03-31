@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Data cache (parquet files, regenerated automatically)
+data/_cache/
+
+# Environment
+.env
+*.env
+
+# Mac
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/
+
+# IDEs
+.vscode/
+.idea/
