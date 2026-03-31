@@ -1,0 +1,57 @@
+countries:
+  CHL:
+    name: Chile
+    fx_ticker: "CLPUSD=X"
+    fx_invert: true
+    equity_ticker: "ECH"
+    currency: CLP
+  BRA:
+    name: Brazil
+    fx_ticker: "BRL=X"
+    fx_invert: false
+    equity_ticker: "EWZ"
+    currency: BRL
+  MEX:
+    name: Mexico
+    fx_ticker: "MXN=X"
+    fx_invert: false
+    equity_ticker: "EWW"
+    currency: MXN
+  COL:
+    name: Colombia
+    fx_ticker: "COP=X"
+    fx_invert: false
+    equity_ticker: "GXG"
+    currency: COP
+  PER:
+    name: Peru
+    fx_ticker: "PEN=X"
+    fx_invert: false
+    equity_ticker: "EPU"
+    currency: PEN
+
+global_risk:
+  vix: "^VIX"
+  dxy: "DX-Y.NYB"
+  spy: "SPY"
+  eem: "EEM"
+
+fred_series:
+  em_spread: "BAMLEMCBPIOAS"
+  us_hy_spread: "BAMLH0A0HYM2"
+  us_10y: "DGS10"
+  commodities: "PALLFNFINDEXM"
+
+turbulence:
+  default_window: 252
+  min_window: 60
+  shrinkage_method: "ledoit_wolf"
+  regime_thresholds:
+    elevated: 0.75
+    turbulent: 0.90
+    crisis: 0.95
+
+absorption_ratio:
+  variance_fraction: 0.20
+  default_window: 252
+  shock_threshold: 0.01
