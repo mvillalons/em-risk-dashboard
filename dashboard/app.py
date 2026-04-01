@@ -5,17 +5,12 @@ EM Risk Dashboard — Streamlit Application
 ==============================
 
 Run with: streamlit run dashboard/app.py
-
-Data mode: set DATA_MODE env var to 'live' (yfinance) or 'synthetic' (default).
-  export DATA_MODE=live   # uses data/fetcher.py + yfinance
-  export DATA_MODE=synthetic  # uses data/synthetic.py (no API needed)
 """
 
 import os
 import sys
 from pathlib import Path
 
-# Path setup — works whether launched from root or dashboard/
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -28,13 +23,12 @@ import streamlit as st
 
 from modules.turbulence import compute_turbulence_index, crisis_episodes, REGIME_COLORS
 from modules.absorption import compute_absorption_ratio
+from modules.pca_kalman import compute_dynamic_factors_v2
 from data.synthetic import generate_em_universe, get_regime_series
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-
-DATA_MODE = os.environ.get("DATA_MODE", "synthetic")
 
 COUNTRY_NAMES = {
     "CLP": "Chile",
@@ -77,7 +71,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Inject custom CSS
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
@@ -126,59 +119,83 @@ div[data-testid="stSidebar"] { background: #080d12; }
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner="Loading market data...")
-def load_data(mode: str, start: str, end: str, window: int):
-    if mode == "synthetic":
-        uni = generate_em_universe(start=start, end=end, seed=42)
-        fx_ret = uni.fx
-        eq_ret = uni.equity
-        panel = uni.panel
+def load_data(
+    data_mode: str,
+    start: str,
+    end: str,
+    window: int,
+    lam: float,
+    vol_standardize: bool,
+):
+    if data_mode == "Live":
+        try:
+            from data.fetcher import load_em_universe
+            from core.returns import log_returns
+            raw = load_em_universe(start=start)
+            fx_ret     = log_returns(raw["fx"])
+            eq_ret     = log_returns(raw["equity"])
+            global_ret = log_returns(raw["global"])
+            panel      = pd.concat([fx_ret, eq_ret, global_ret], axis=1).dropna(how="all")
+            prices_fx  = raw["fx"]
+            prices_eq  = raw["equity"]
+        except Exception as e:
+            st.warning(f"Live fetch failed ({e}), using synthetic data.")
+            data_mode = "Synthetic"
+
+    if data_mode == "Synthetic":
+        uni       = generate_em_universe(start=start, end=end, seed=42)
+        fx_ret    = uni.fx
+        eq_ret    = uni.equity
+        panel     = uni.panel
         prices_fx = uni.prices_fx
         prices_eq = uni.prices_eq
-    else:
-        from data.fetcher import load_em_universe
-        from core.returns import log_returns
-        raw = load_em_universe(start=start)
-        fx_ret = log_returns(raw["fx"])
-        eq_ret = log_returns(raw["equity"])
-        global_ret = log_returns(raw["global"])
-        panel = pd.concat([fx_ret, eq_ret, global_ret], axis=1).dropna(how="all")
-        prices_fx = raw["fx"]
-        prices_eq = raw["equity"]
 
-    # Turbulence: FX panel (primary signal)
-    turb_fx = compute_turbulence_index(fx_ret, window=window, min_periods=60)
+    # Turbulence indices — pass lam and vol_standardize through
+    turb_fx = compute_turbulence_index(
+        fx_ret, window=window, min_periods=60,
+        vol_standardize=vol_standardize, slow_window=max(window, 252),
+    )
+    turb_eq = compute_turbulence_index(
+        eq_ret, window=window, min_periods=60,
+        vol_standardize=vol_standardize, slow_window=max(window, 252),
+    )
+    turb_panel = compute_turbulence_index(
+        panel, window=window, min_periods=60,
+        vol_standardize=vol_standardize, slow_window=max(window, 252),
+    )
 
-    # Turbulence: Equity panel
-    turb_eq = compute_turbulence_index(eq_ret, window=window, min_periods=60)
+    # Absorption Ratio — EWMA track with user-selected lam
+    ar_fx = compute_absorption_ratio(fx_ret, window=window, min_periods=60, lam=lam)
 
-    # Turbulence: Full panel
-    turb_panel = compute_turbulence_index(panel, window=window, min_periods=60)
+    # Dynamic factors v2 — KalmanCorrelation on panel
+    dyn = compute_dynamic_factors_v2(
+        panel, window=window, n_components=3, min_periods=60, lam=lam,
+    )
 
-    # Absorption Ratio: FX
-    ar_fx = compute_absorption_ratio(fx_ret, window=window, min_periods=60)
-
-    # Per-country turbulence (single-asset, for country scorecards)
+    # Per-country turbulence (FX + paired equity column)
     country_turb = {}
     for col in fx_ret.columns:
-        single = fx_ret[[col]].copy()
-        # For single asset, turbulence = standardized squared return
+        paired_eq_col = list(eq_ret.columns)[list(fx_ret.columns).index(col)]
         ct = compute_turbulence_index(
-            pd.concat([single, eq_ret[[list(eq_ret.columns)[list(fx_ret.columns).index(col)]]]], axis=1),
-            window=window, min_periods=60
+            pd.concat([fx_ret[[col]], eq_ret[[paired_eq_col]]], axis=1),
+            window=window, min_periods=60,
+            vol_standardize=vol_standardize, slow_window=max(window, 252),
         )
         country_turb[col] = ct
 
     return {
-        "fx_ret": fx_ret,
-        "eq_ret": eq_ret,
-        "panel": panel,
-        "prices_fx": prices_fx,
-        "prices_eq": prices_eq,
-        "turb_fx": turb_fx,
-        "turb_eq": turb_eq,
-        "turb_panel": turb_panel,
-        "ar_fx": ar_fx,
+        "fx_ret":       fx_ret,
+        "eq_ret":       eq_ret,
+        "panel":        panel,
+        "prices_fx":    prices_fx,
+        "prices_eq":    prices_eq,
+        "turb_fx":      turb_fx,
+        "turb_eq":      turb_eq,
+        "turb_panel":   turb_panel,
+        "ar_fx":        ar_fx,
+        "dyn":          dyn,
         "country_turb": country_turb,
+        "data_mode":    data_mode,
     }
 
 
@@ -190,34 +207,38 @@ with st.sidebar:
     st.markdown("### ⚙️ Dashboard Controls")
     st.markdown("---")
 
-    data_mode_display = "🔴 Live (yfinance)" if DATA_MODE == "live" else "🟡 Synthetic"
-    st.markdown(f"**Data mode:** {data_mode_display}")
-    st.caption("Set `DATA_MODE=live` env var to connect live data.")
-    st.markdown("---")
+    data_mode = st.radio("Data source", ["Synthetic", "Live"], index=0)
 
+    st.markdown("---")
     start_date = st.date_input("Start date", value=pd.Timestamp("2015-01-01"))
     end_date   = st.date_input("End date",   value=pd.Timestamp("2024-12-31"))
 
     st.markdown("---")
-    window = st.slider("Rolling window (trading days)", 60, 504, 252, step=21,
-                        help="Window for estimating μ and Σ in the Mahalanobis distance")
+    window = st.slider(
+        "Rolling window (trading days)", 60, 504, 252, step=21,
+        help="Window for estimating μ and Σ in the Mahalanobis distance",
+    )
+    lam = st.slider(
+        "EWMA decay lambda", 0.90, 0.99, 0.94, step=0.01,
+        help="Controls EWMA responsiveness: higher = slower decay, smoother estimates",
+    )
+    vol_standardize = st.toggle("Vol-standardize turbulence", value=True,
+        help="Pre-whiten returns with EWMA vol before Mahalanobis computation. "
+             "Suppresses pure vol spikes; tau captures correlation anomalies.")
+
     signal_layer = st.selectbox(
         "Primary signal layer",
         ["FX Returns", "Equity Returns", "Full Panel (FX + Equity + Global)"],
         index=0,
     )
-    cov_method = st.selectbox(
-        "Covariance estimator",
-        ["ledoit_wolf", "oas", "sample", "ewm"],
-        index=0,
-    )
     st.markdown("---")
-    show_decomp = st.checkbox("Show Mahalanobis decomposition", value=True)
-    show_ar = st.checkbox("Show Absorption Ratio", value=True)
+    show_decomp  = st.checkbox("Show Mahalanobis decomposition", value=True)
+    show_ar      = st.checkbox("Show Absorption Ratio", value=True)
+    show_inorm   = st.checkbox("Show Correlation Regime Shock", value=True)
     show_heatmap = st.checkbox("Show correlation heatmap", value=True)
 
     st.markdown("---")
-    st.caption("EM Risk Dashboard v0.1 · Prototype")
+    st.caption("EM Risk Dashboard v0.2 · Prototype")
 
 
 # ---------------------------------------------------------------------------
@@ -225,22 +246,26 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 data = load_data(
-    mode=DATA_MODE,
+    data_mode=data_mode,
     start=str(start_date),
     end=str(end_date),
     window=window,
+    lam=lam,
+    vol_standardize=vol_standardize,
 )
 
-# Select active turbulence result
+# Resolve active turbulence result
 signal_map = {
-    "FX Returns": "turb_fx",
-    "Equity Returns": "turb_eq",
-    "Full Panel (FX + Equity + Global)": "turb_panel",
+    "FX Returns":                           "turb_fx",
+    "Equity Returns":                       "turb_eq",
+    "Full Panel (FX + Equity + Global)":    "turb_panel",
 }
 active_turb = data[signal_map[signal_layer]]
-ar = data["ar_fx"]
-fx_ret = data["fx_ret"]
-eq_ret = data["eq_ret"]
+ar          = data["ar_fx"]
+dyn         = data["dyn"]
+fx_ret      = data["fx_ret"]
+eq_ret      = data["eq_ret"]
+actual_mode = data["data_mode"]
 
 
 # ---------------------------------------------------------------------------
@@ -253,11 +278,16 @@ current_pctile = active_turb.current_pctile()
 last_date      = active_turb.turbulence.dropna().index[-1]
 badge_css      = REGIME_BADGE_CSS.get(current_regime, "")
 
+mode_badge = "🟢 Live" if actual_mode == "Live" else "🟡 Synthetic"
+
 col_title, col_regime, col_spacer = st.columns([3, 1.5, 2])
 
 with col_title:
     st.markdown("## 📡 EM Risk Dashboard")
-    st.caption(f"Latin America · Turbulence & Fragility Monitor · Last observation: **{last_date.strftime('%d %b %Y')}**")
+    st.caption(
+        f"Latin America · Turbulence & Fragility Monitor · "
+        f"Last observation: **{last_date.strftime('%d %b %Y')}** · {mode_badge}"
+    )
 
 with col_regime:
     st.markdown("<br>", unsafe_allow_html=True)
@@ -320,16 +350,15 @@ cc = st.columns(5)
 
 countries = list(COUNTRY_NAMES.keys())
 for i, ctry in enumerate(countries):
-    ct = data["country_turb"][ctry]
-    score = ct.current_score()
+    ct     = data["country_turb"][ctry]
+    score  = ct.current_score()
     pctile = ct.current_pctile()
     regime = ct.current_regime()
-    badge = REGIME_BADGE_CSS.get(regime, "")
+    badge  = REGIME_BADGE_CSS.get(regime, "")
 
-    # FX performance (last 5 days annualized)
     recent_fx = fx_ret[ctry].dropna().iloc[-5:].mean() * 252
-    fx_arrow = "▲" if recent_fx > 0 else "▼"
-    fx_color = "#2ecc71" if recent_fx > 0 else "#e74c3c"
+    fx_arrow  = "▲" if recent_fx > 0 else "▼"
+    fx_color  = "#2ecc71" if recent_fx > 0 else "#e74c3c"
 
     with cc[i]:
         st.markdown(
@@ -360,12 +389,11 @@ st.markdown("---")
 
 st.markdown("#### Turbulence Index — " + signal_layer)
 
-turb_series = active_turb.turbulence.dropna()
-regime_series = active_turb.regime.reindex(turb_series.index)
+turb_series    = active_turb.turbulence.dropna()
+regime_series  = active_turb.regime.reindex(turb_series.index)
 
 fig_turb = go.Figure()
 
-# Regime shading
 regime_colors_hex = {
     "Calm":      "rgba(46, 204, 113, 0.05)",
     "Elevated":  "rgba(243, 156, 18, 0.10)",
@@ -374,15 +402,14 @@ regime_colors_hex = {
 }
 
 for label, color in regime_colors_hex.items():
-    mask = regime_series == label
+    mask    = regime_series == label
     if not mask.any():
         continue
-    # Find contiguous blocks
     in_block = False
-    x0 = None
+    x0       = None
     for date, val in mask.items():
         if val and not in_block:
-            x0 = date
+            x0       = date
             in_block = True
         elif not val and in_block:
             fig_turb.add_vrect(x0=x0, x1=date, fillcolor=color, line_width=0)
@@ -390,7 +417,6 @@ for label, color in regime_colors_hex.items():
     if in_block:
         fig_turb.add_vrect(x0=x0, x1=mask.index[-1], fillcolor=color, line_width=0)
 
-# Threshold lines
 for label, thresh_key in [("Elevated", "elevated"), ("Turbulent", "turbulent"), ("Crisis", "crisis")]:
     thresh_val = active_turb.thresholds[thresh_key]
     fig_turb.add_hline(
@@ -405,7 +431,6 @@ for label, thresh_key in [("Elevated", "elevated"), ("Turbulent", "turbulent"), 
         annotation_font_color=REGIME_COLORS[label],
     )
 
-# Main turbulence series
 fig_turb.add_trace(go.Scatter(
     x=turb_series.index,
     y=turb_series.values,
@@ -417,7 +442,7 @@ fig_turb.add_trace(go.Scatter(
 ))
 
 if show_decomp:
-    mag = active_turb.magnitude_component.reindex(turb_series.index)
+    mag       = active_turb.magnitude_component.reindex(turb_series.index)
     corr_comp = active_turb.correlation_component.reindex(turb_series.index)
     fig_turb.add_trace(go.Scatter(
         x=mag.index, y=mag.values,
@@ -436,7 +461,10 @@ fig_turb.update_layout(
     margin=dict(l=40, r=80, t=20, b=40),
     legend=dict(orientation="h", y=1.02, x=0),
     xaxis=dict(showgrid=False),
-    yaxis=dict(title="τ (Mahalanobis²)", gridcolor="#1e2a35", gridwidth=0.5),
+    yaxis=dict(
+        title="τ (Mahalanobis²)" + (" — vol-standardized" if vol_standardize else ""),
+        gridcolor="#1e2a35", gridwidth=0.5,
+    ),
     plot_bgcolor="#0d1117",
     paper_bgcolor="#0d1117",
 )
@@ -444,15 +472,15 @@ st.plotly_chart(fig_turb, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
-# Absorption Ratio + Chi-squared p-value
+# Spectral Fragility: Absorption Ratio + Chi-squared p-value
 # ---------------------------------------------------------------------------
 
 if show_ar:
-    st.markdown("#### Fragility Monitor")
+    st.markdown("#### Spectral Fragility Monitor")
     col_ar, col_pval = st.columns([1, 1])
 
     with col_ar:
-        ar_series = ar.absorption_ratio.dropna()
+        ar_series  = ar.absorption_ratio.dropna()
         dar_series = ar.standardized_delta.reindex(ar_series.index)
 
         fig_ar = make_subplots(
@@ -496,15 +524,16 @@ if show_ar:
             yaxis2=dict(title="σ(ΔAR)", gridcolor="#1e2a35"),
             xaxis2=dict(showgrid=False),
         )
-        st.markdown("**Absorption Ratio** (eigenvalue concentration)")
+        st.markdown(f"**Absorption Ratio** (EWMA λ={lam:.2f})")
         st.plotly_chart(fig_ar, use_container_width=True)
         st.caption(
             "AR = fraction of FX panel variance explained by top 20% of eigenvectors. "
-            "Higher = more systemic. Standardized ΔAR > 1.5σ historically precedes stress episodes by 5–15 days."
+            "Higher = more systemic. Standardized ΔAR > 1.5σ historically precedes stress episodes by 5–15 days. "
+            f"EWMA λ={lam:.2f} — decrease λ for faster reaction."
         )
 
     with col_pval:
-        pval = active_turb.chi2_pvalue.dropna()
+        pval     = active_turb.chi2_pvalue.dropna()
         log_pval = -np.log10(pval.clip(1e-10))
 
         fig_pval = go.Figure()
@@ -544,6 +573,74 @@ if show_ar:
             "Persistent rejection = structural break in joint distribution."
         )
 
+    # --- Correlation Regime Shock: ||ΔR||_F ---
+    if show_inorm:
+        inorm = dyn.pca.innovation_norm.dropna()
+
+        if len(inorm) > 0:
+            inorm_mean = float(inorm.mean())
+            inorm_std  = float(inorm.std())
+            threshold  = inorm_mean + 2.0 * inorm_std
+
+            spike_dates = inorm.index[inorm > threshold]
+
+            fig_inorm = go.Figure()
+
+            fig_inorm.add_trace(go.Scatter(
+                x=inorm.index,
+                y=inorm.values,
+                mode="lines",
+                name="||ΔR||_F",
+                line=dict(color="#e74c3c", width=1.2),
+                fill="tozeroy",
+                fillcolor="rgba(231,76,60,0.07)",
+            ))
+
+            fig_inorm.add_hline(
+                y=threshold,
+                line_dash="dash",
+                line_color="#f39c12",
+                line_width=1.0,
+                annotation_text="mean + 2σ",
+                annotation_position="right",
+                annotation_font_size=10,
+                annotation_font_color="#f39c12",
+            )
+
+            # Vertical dashed lines at spike dates (subsample to avoid clutter)
+            for dt in spike_dates:
+                fig_inorm.add_vline(
+                    x=dt,
+                    line_dash="dash",
+                    line_color="rgba(243,156,18,0.35)",
+                    line_width=0.8,
+                )
+
+            fig_inorm.update_layout(
+                title=dict(
+                    text="Correlation Regime Shock  ||ΔR||_F",
+                    font=dict(size=13),
+                    x=0.0,
+                ),
+                template=PLOTLY_TEMPLATE,
+                height=280,
+                margin=dict(l=40, r=80, t=40, b=40),
+                showlegend=False,
+                plot_bgcolor="#0d1117",
+                paper_bgcolor="#0d1117",
+                yaxis=dict(title="Frobenius norm", gridcolor="#1e2a35"),
+                xaxis=dict(showgrid=False),
+            )
+
+            st.plotly_chart(fig_inorm, use_container_width=True)
+            n_spikes = len(spike_dates)
+            st.caption(
+                f"Frobenius norm of one-step Kalman innovation on EWMA correlation matrix: "
+                f"||R̂_t − R_{{t|t-1}}||_F. "
+                f"Dashed lines mark {n_spikes} dates above mean + 2σ = {threshold:.3f}. "
+                f"Spikes indicate rapid correlation regime transitions not captured by slow-moving estimators."
+            )
+
 st.markdown("---")
 
 
@@ -557,7 +654,7 @@ if show_heatmap:
     window_corr = st.slider(
         "Correlation window (days)", 30, 252, 90,
         key="corr_window",
-        help="Short windows reveal crisis-period correlation spikes"
+        help="Short windows reveal crisis-period correlation spikes",
     )
 
     corr_now   = fx_ret.iloc[-window_corr:].corr()
@@ -621,9 +718,9 @@ st.markdown("#### Price Levels (rebased to 100)")
 col_px1, col_px2 = st.columns(2)
 
 with col_px1:
-    prices_fx = data["prices_fx"]
-    fig_fx = go.Figure()
-    colors_fx = [ACCENT, "#e74c3c", "#f39c12", "#9b59b6", "#3498db"]
+    prices_fx  = data["prices_fx"]
+    fig_fx     = go.Figure()
+    colors_fx  = [ACCENT, "#e74c3c", "#f39c12", "#9b59b6", "#3498db"]
     for i, col in enumerate(prices_fx.columns):
         fig_fx.add_trace(go.Scatter(
             x=prices_fx.index, y=prices_fx[col],
@@ -643,7 +740,7 @@ with col_px1:
 
 with col_px2:
     prices_eq = data["prices_eq"]
-    fig_eq = go.Figure()
+    fig_eq    = go.Figure()
     for i, col in enumerate(prices_eq.columns):
         fig_eq.add_trace(go.Scatter(
             x=prices_eq.index, y=prices_eq[col],
@@ -674,11 +771,11 @@ for regime_label, min_dur in [("Crisis", 3), ("Turbulent", 5)]:
     eps = crisis_episodes(active_turb, regime=regime_label, min_duration_days=min_dur)
     if len(eps) == 0:
         continue
-    eps["start"] = pd.to_datetime(eps["start"]).dt.strftime("%Y-%m-%d")
-    eps["end"]   = pd.to_datetime(eps["end"]).dt.strftime("%Y-%m-%d")
-    eps["peak_tau"]  = eps["peak_tau"].round(1)
-    eps["mean_tau"]  = eps["mean_tau"].round(1)
-    eps.columns = ["Start", "End", "Duration (days)", "Peak τ", "Mean τ"]
+    eps["start"]    = pd.to_datetime(eps["start"]).dt.strftime("%Y-%m-%d")
+    eps["end"]      = pd.to_datetime(eps["end"]).dt.strftime("%Y-%m-%d")
+    eps["peak_tau"] = eps["peak_tau"].round(1)
+    eps["mean_tau"] = eps["mean_tau"].round(1)
+    eps.columns     = ["Start", "End", "Duration (days)", "Peak τ", "Mean τ"]
     st.markdown(f"**{regime_label} episodes** (≥ {min_dur} days)")
     st.dataframe(eps, use_container_width=True, hide_index=True)
 
@@ -690,24 +787,22 @@ st.markdown("---")
 # ---------------------------------------------------------------------------
 
 st.markdown("#### Returns Conditioned on Risk Regime")
-st.caption("Average annualized FX return per regime — separating regime impact from other factors")
+st.caption("Average annualized FX return per regime")
 
 regime_aligned = active_turb.regime.reindex(fx_ret.index).dropna()
-fx_aligned = fx_ret.reindex(regime_aligned.index)
+fx_aligned     = fx_ret.reindex(regime_aligned.index)
 
 regime_returns = {}
 for label in ["Calm", "Elevated", "Turbulent", "Crisis"]:
     mask = regime_aligned == label
     if mask.sum() == 0:
         continue
-    ann_rets = fx_aligned[mask].mean() * 252 * 100  # annualized %
-    regime_returns[label] = ann_rets
+    regime_returns[label] = fx_aligned[mask].mean() * 252 * 100
 
 df_regime = pd.DataFrame(regime_returns).T
 if not df_regime.empty:
     fig_reg = go.Figure()
-    countries_plot = list(df_regime.columns)
-    x_labels = [f"{FLAG.get(c,'')} {c}" for c in countries_plot]
+    x_labels = [f"{FLAG.get(c,'')} {c}" for c in df_regime.columns]
 
     for regime_label in df_regime.index:
         color = REGIME_COLORS.get(regime_label, MUTED)
@@ -729,16 +824,12 @@ if not df_regime.empty:
         plot_bgcolor="#0d1117", paper_bgcolor="#0d1117",
     )
     st.plotly_chart(fig_reg, use_container_width=True)
-    st.caption(
-        "All series are synthetic calibrated data. In live mode, this table reveals the "
-        "average carry/depreciation cost of EM FX exposure conditional on the risk regime, "
-        "which directly informs U.S. portfolio EM allocation decisions."
-    )
 
 st.markdown("---")
 st.caption(
-    "EM Risk Dashboard — Prototype v0.1 · "
-    f"Data: {'Synthetic (calibrated to 2015–2024 EM history)' if DATA_MODE == 'synthetic' else 'Live (yfinance + FRED)'} · "
-    "Method: Kritzman & Li (2010) Turbulence Index + Absorption Ratio · "
+    "EM Risk Dashboard — Prototype v0.2 · "
+    f"Data: {'Synthetic (calibrated to 2015–2024 EM history)' if actual_mode == 'Synthetic' else 'Live (yfinance + FRED)'} · "
+    f"λ={lam:.2f} · vol-standardize={'on' if vol_standardize else 'off'} · "
+    "Method: Kritzman & Li (2010) Turbulence + Absorption Ratio + KalmanCorrelation · "
     "Built with Python / Streamlit / Plotly"
 )
