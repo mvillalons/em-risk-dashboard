@@ -87,8 +87,10 @@ class ComputedResults:
     fx_ret:        pd.DataFrame
     eq_ret:        pd.DataFrame
     panel:         pd.DataFrame
-    prices_fx:     pd.DataFrame
-    prices_eq:     pd.DataFrame
+    prices_fx:     pd.DataFrame      # rebased index (cumprod*100) — used by existing pipeline
+    prices_eq:     pd.DataFrame      # rebased index (cumprod*100) — used by existing pipeline
+    raw_prices_fx: pd.DataFrame      # actual price levels for verification exports
+    raw_prices_eq: pd.DataFrame      # actual price levels for verification exports
     vol_std_ret:   Optional[pd.DataFrame]
     turb_panel:    TurbulenceResult
     turb_fx:       TurbulenceResult
@@ -121,6 +123,8 @@ def _load_synthetic(params: AuditParams) -> ComputedResults:
         panel=panel,
         prices_fx=prices_fx,
         prices_eq=prices_eq,
+        raw_prices_fx=prices_fx,   # synthetic: rebased index serves as "level"
+        raw_prices_eq=prices_eq,
         ticker_quality=None,
         params=params,
     )
@@ -167,11 +171,11 @@ def _load_live(params: AuditParams) -> Optional[ComputedResults]:
     panel_parts = [df for df in [fx_ret, eq_ret, gl_ret] if not df.empty]
     panel = pd.concat(panel_parts, axis=1).dropna(how="all")
 
-    # Use price series as proxy for rebased levels
-    prices_fx = (1 + fx_ret).cumprod() * 100 if not fx_ret.empty else pd.DataFrame()
-    prices_eq = (1 + eq_ret).cumprod() * 100 if not eq_ret.empty else pd.DataFrame()
+    # Rebased index for existing pipeline fields (prices_fx/prices_eq)
+    prices_fx_rebased = (1 + fx_ret).cumprod() * 100 if not fx_ret.empty else pd.DataFrame()
+    prices_eq_rebased = (1 + eq_ret).cumprod() * 100 if not eq_ret.empty else pd.DataFrame()
 
-    # ---- Data quality stats ----
+    # ---- Data quality stats — use raw yfinance prices ----
     all_prices: dict[str, tuple[pd.Series, str]] = {}
     for col in fx_prices.columns:
         all_prices[col] = (fx_prices[col], "fx")
@@ -195,8 +199,10 @@ def _load_live(params: AuditParams) -> Optional[ComputedResults]:
         fx_ret=fx_ret,
         eq_ret=eq_ret,
         panel=panel,
-        prices_fx=prices_fx,
-        prices_eq=prices_eq,
+        prices_fx=prices_fx_rebased,
+        prices_eq=prices_eq_rebased,
+        raw_prices_fx=fx_prices,    # unadjusted yfinance closing prices
+        raw_prices_eq=eq_prices,    # unadjusted yfinance closing prices
         ticker_quality=ticker_quality,
         params=params,
     )
@@ -213,6 +219,8 @@ def _run_pipeline(
     panel: pd.DataFrame,
     prices_fx: pd.DataFrame,
     prices_eq: pd.DataFrame,
+    raw_prices_fx: pd.DataFrame,
+    raw_prices_eq: pd.DataFrame,
     ticker_quality: Optional[pd.DataFrame],
     params: AuditParams,
 ) -> ComputedResults:
@@ -305,6 +313,8 @@ def _run_pipeline(
         panel=panel,
         prices_fx=prices_fx,
         prices_eq=prices_eq,
+        raw_prices_fx=raw_prices_fx,
+        raw_prices_eq=raw_prices_eq,
         vol_std_ret=vol_std_ret,
         turb_panel=turb_panel,
         turb_fx=turb_fx,
@@ -399,6 +409,18 @@ def _compute_ticker_quality(
             skewness = float("nan")
             exc_kurt = float("nan")
 
+        # ---- Price-level stats for verification ----
+        latest_price     = float(valid.iloc[-1])  if n_obs > 0 else float("nan")
+        latest_date_str  = str(valid.index[-1].date()) if n_obs > 0 else ""
+        window_52w       = valid.iloc[-252:] if n_obs > 0 else pd.Series(dtype=float)
+        price_52w_high   = float(window_52w.max()) if len(window_52w) > 0 else float("nan")
+        price_52w_low    = float(window_52w.min()) if len(window_52w) > 0 else float("nan")
+        price_vs_52w_high = (
+            round(latest_price / price_52w_high * 100, 2)
+            if not np.isnan(price_52w_high) and price_52w_high > 0
+            else float("nan")
+        )
+
         rows.append({
             "ticker":                  ticker,
             "asset_class":             asset_class,
@@ -412,6 +434,11 @@ def _compute_ticker_quality(
             "annualized_vol":          round(ann_vol * 100, 2) if not np.isnan(ann_vol) else float("nan"),
             "skewness":                round(skewness, 4) if not np.isnan(skewness) else float("nan"),
             "excess_kurtosis":         round(exc_kurt, 4) if not np.isnan(exc_kurt) else float("nan"),
+            "latest_price":            round(latest_price, 6) if not np.isnan(latest_price) else float("nan"),
+            "latest_date":             latest_date_str,
+            "price_52w_high":          round(price_52w_high, 6) if not np.isnan(price_52w_high) else float("nan"),
+            "price_52w_low":           round(price_52w_low, 6) if not np.isnan(price_52w_low) else float("nan"),
+            "price_vs_52w_high":       price_vs_52w_high,
         })
 
     df = pd.DataFrame(rows)
@@ -712,6 +739,104 @@ def _export_country_turbulence(results: ComputedResults, out_dir: Path) -> None:
     logger.info("  → 11_country_turbulence.csv  %s", df.shape)
 
 
+def _export_price_levels_fx(results: ComputedResults, out_dir: Path) -> None:
+    """
+    Export 00_price_levels_fx.csv — FX closing price levels.
+
+    For synthetic mode: rebased index (100 at start) from EMUniverse.prices_fx.
+    For live mode: unadjusted yfinance closing prices (local currency per USD).
+    Values match Bloomberg/Reuters/BCCh quotes for live data.
+    """
+    if results.raw_prices_fx.empty:
+        return
+    df = results.raw_prices_fx.copy()
+    df.index.name = "date"
+    df.to_csv(out_dir / "00_price_levels_fx.csv")
+    logger.info("  → 00_price_levels_fx.csv  %s", df.shape)
+
+
+def _export_price_levels_equity(results: ComputedResults, out_dir: Path) -> None:
+    """
+    Export 00_price_levels_equity.csv — equity ETF closing price levels.
+
+    For synthetic mode: rebased index (100 at start) from EMUniverse.prices_eq.
+    For live mode: unadjusted yfinance closing prices in USD.
+    Values match Yahoo Finance closing prices for live data.
+    """
+    if results.raw_prices_eq.empty:
+        return
+    df = results.raw_prices_eq.copy()
+    df.index.name = "date"
+    df.to_csv(out_dir / "00_price_levels_equity.csv")
+    logger.info("  → 00_price_levels_equity.csv  %s", df.shape)
+
+
+def _ewma_ann_vol(ret: pd.Series, span: int) -> pd.Series:
+    """
+    Compute annualized EWMA volatility using pandas ewm(span=span).
+
+    Parameters
+    ----------
+    ret  : log return series
+    span : EWM span in trading days (21 ≈ 1 month, 63 ≈ 1 quarter)
+
+    Returns
+    -------
+    pd.Series of annualized vols (same index as ret, NaN until span/2 observations).
+    """
+    return ret.ewm(span=span, min_periods=span // 2).std() * np.sqrt(252)
+
+
+def _export_returns_vs_levels(results: ComputedResults, out_dir: Path) -> None:
+    """
+    Export 00_returns_vs_levels.csv — long-format returns and price levels.
+
+    Columns: date, series_name, price_level, log_return, simple_return,
+             ewma_vol_21d (annualized), ewma_vol_63d (annualized).
+    One row per date per series; all 10 FX + equity series in one file.
+    Easier to filter in Excel than the wide-format return files.
+    """
+    frames: list[pd.DataFrame] = []
+
+    pairs: list[tuple[str, pd.DataFrame, pd.DataFrame]] = []
+    if not results.fx_ret.empty and not results.raw_prices_fx.empty:
+        pairs.append(("fx", results.fx_ret, results.raw_prices_fx))
+    if not results.eq_ret.empty and not results.raw_prices_eq.empty:
+        pairs.append(("equity", results.eq_ret, results.raw_prices_eq))
+
+    for _asset_class, ret_df, price_df in pairs:
+        for col in ret_df.columns:
+            log_ret = ret_df[col]
+            # Align price to return index (price has one extra row at the start)
+            price   = price_df[col].reindex(log_ret.index) if col in price_df.columns else pd.Series(
+                float("nan"), index=log_ret.index
+            )
+            simple_ret    = np.expm1(log_ret)
+            ewma_vol_21d  = _ewma_ann_vol(log_ret, span=21)
+            ewma_vol_63d  = _ewma_ann_vol(log_ret, span=63)
+
+            chunk = pd.DataFrame({
+                "series_name":   col,
+                "price_level":   price,
+                "log_return":    log_ret,
+                "simple_return": simple_ret,
+                "ewma_vol_21d":  ewma_vol_21d,
+                "ewma_vol_63d":  ewma_vol_63d,
+            })
+            chunk.index.name = "date"
+            frames.append(chunk.reset_index())
+
+    if not frames:
+        return
+
+    df = pd.concat(frames, ignore_index=False).sort_values(["date", "series_name"])
+    df.to_csv(out_dir / "00_returns_vs_levels.csv", index=False)
+    logger.info(
+        "  → 00_returns_vs_levels.csv  (%d rows × %d series)",
+        len(df), df["series_name"].nunique(),
+    )
+
+
 def export_all(
     results: ComputedResults,
     out_dir: Path,
@@ -738,6 +863,9 @@ def export_all(
     _export_absorption(results, out_dir)
     _export_pca_kalman(results, out_dir)
     _export_country_turbulence(results, out_dir)
+    _export_price_levels_fx(results, out_dir)
+    _export_price_levels_equity(results, out_dir)
+    _export_returns_vs_levels(results, out_dir)
 
 
 # ---------------------------------------------------------------------------
