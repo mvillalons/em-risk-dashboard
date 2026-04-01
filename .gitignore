@@ -21,3 +21,6 @@ notebooks/
 # IDEs
 .vscode/
 .idea/
+
+# Audit export artefacts
+audit_exports/

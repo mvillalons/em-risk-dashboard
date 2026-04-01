@@ -53,13 +53,13 @@ Never change these without explicit instruction:
 - Cache lives in data/_cache/ as parquet files
 - Tests use synthetic deterministic data (seed=42), never live data
 
-Covariance estimation — two-track design (NOT YET IMPLEMENTED):
+Covariance estimation — two-track design:
 - SLOW track (window=504, Ledoit-Wolf): feeds turbulence.py only
   Rationale: tau measures deviation from long-run structural normality.
 - FAST track (EWMA, lambda~0.94): feeds absorption.py and pca_kalman.py
   Rationale: AR and PCA track current correlation architecture in real time.
 - VolStandardizer (EWMA D_t): pre-whitens returns before turbulence computation.
-core/covariance.py does not exist yet. This is Session 1 of the roadmap.
+core/covariance.py: SlowCovariance, FastCovariance, VolStandardizer, KalmanCorrelation.
 
 ---
 
@@ -106,27 +106,23 @@ pytest tests/ -v
 
 Done and tested:
 - core/returns.py
-- modules/turbulence.py (Mahalanobis tau, decomposition, regimes, TurbulenceResult)
-- modules/absorption.py (AR, delta AR, AbsorptionResult)
-- modules/pca_kalman.py (rolling PCA, Kalman on factor scores, DynamicFactorResult)
+- core/covariance.py (SlowCovariance, FastCovariance, VolStandardizer, KalmanCorrelation)
+- modules/turbulence.py (Mahalanobis tau + vol-standardization via VolStandardizer)
+- modules/absorption.py (AR via EWMA R_t, delta AR, AbsorptionResult)
+- modules/pca_kalman.py (rolling PCA, KalmanCorrelation on R_t, compute_dynamic_factors_v2)
 - data/synthetic.py, data/fetcher.py, data/validate.py
-- dashboard/app.py (full Streamlit dashboard on synthetic data)
-- tests/test_turbulence.py
+- dashboard/app.py (lam slider, vol-std toggle, data radio, ||ΔR||_F chart)
+- tests/test_covariance.py, tests/test_turbulence.py
+- scripts/export_audit.py (Session 6)
 
-NOT done — this is the active roadmap:
-- core/covariance.py (does not exist)
-- Two-track covariance wired into modules
-- Vol-standardization in turbulence.py
-- EWMA R_t in absorption.py
-- Kalman on R_t (not factor scores) in pca_kalman.py
-- Live data switch in dashboard
+NOT done:
 - DCC-GARCH (deferred)
 
 ---
 
 ## Roadmap — run sessions IN ORDER
 
-### Session 1 — core/covariance.py
+### Session 1 — core/covariance.py  ✓ COMPLETE
 Prerequisite: none. Start here.
 
 Create core/covariance.py with three classes:
@@ -165,7 +161,7 @@ Create tests/test_covariance.py:
 Success criterion: pytest tests/test_covariance.py -v all green.
 Do not modify any existing module until this passes.
 
-### Session 2 — turbulence vol-standardization
+### Session 2 — turbulence vol-standardization  ✓ COMPLETE
 Prerequisite: Session 1 green.
 
 Modify modules/turbulence.py:
@@ -190,7 +186,7 @@ Add to tests/test_turbulence.py — pure vol spike test:
 
 Success criterion: pytest tests/ -v all green including new test.
 
-### Session 3 — EWMA R_t into absorption
+### Session 3 — EWMA R_t into absorption  ✓ COMPLETE
 Prerequisite: Session 1 green. Session 2 not required.
 
 Modify modules/absorption.py:
@@ -209,7 +205,7 @@ After modifying, run this validation in the same session and print output:
 
 Success criterion: pytest tests/ -v green + empirical lead confirmed in printed output.
 
-### Session 4 — Kalman filter on R_t
+### Session 4 — Kalman filter on R_t  ✓ COMPLETE
 Prerequisite: Sessions 1 and 3 complete.
 
 Add KalmanCorrelation class to core/covariance.py:
@@ -245,7 +241,7 @@ Add tests:
 
 Success criterion: pytest tests/ -v green.
 
-### Session 5 — Dashboard integration + live data
+### Session 5 — Dashboard integration + live data  ✓ COMPLETE
 Prerequisite: Sessions 2, 3, 4 complete.
 
 Modify dashboard/app.py:
@@ -267,6 +263,22 @@ Success criterion: streamlit run dashboard/app.py runs without error.
   Test both Synthetic and Live modes manually.
   Confirm lam slider changes AR responsiveness visibly in the chart.
 
+### Session 6 — Audit export script  ✓ COMPLETE
+Prerequisite: Sessions 1–5 complete.
+
+scripts/export_audit.py:
+  CLI: python scripts/export_audit.py [--mode synthetic|live|both] [--start YYYY-MM-DD]
+       [--slow-window N] [--min-periods N] [--lam F] [--vol-std/--no-vol-std]
+       [--output-dir PATH]
+  Exports all computed time series to CSV under audit_exports/{synthetic,live}/.
+  Files: 00_summary, 00_data_quality (live), 01-02 raw returns, 03 vol-std returns,
+    04-06 turbulence (panel/fx/equity), 07 absorption ratio,
+    08-10 PCA/Kalman/innovation norm, 11 country turbulence.
+  Live data quality flags: nan_pct > 2%, max gap > 5d, FX vol outside 5-35%,
+    equity vol outside 10-50%.
+  mode=both: prints synthetic vs live comparison table to terminal.
+  audit_exports/ is in .gitignore.
+
 ---
 
 ## Style and conventions
@@ -287,3 +299,7 @@ Success criterion: streamlit run dashboard/app.py runs without error.
 - np.linalg.cholesky fails near-singular. Use eigenvalue floor before Cholesky.
 - st.cache_data won't invalidate on code change. Restart streamlit manually.
 - SVD eigenvector sign is arbitrary. Do not interpret loading sign across time.
+
+## Important: git workflow
+Always work directly in the main repo files, not in worktrees.
+At the end of every session: git add -A && git commit -m 'Session N: description' && git push
