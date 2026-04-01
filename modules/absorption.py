@@ -34,6 +34,7 @@ from scipy.linalg import eigh  # More numerically stable than eig for symmetric 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.returns import clean_returns
+from core.covariance import FastCovariance
 
 
 @dataclass
@@ -101,6 +102,7 @@ def compute_absorption_ratio(
     min_periods: int = 60,
     variance_fraction: float = 0.20,
     winsorize: float = 5.0,
+    lam: Optional[float] = 0.94,
 ) -> AbsorptionResult:
     """
     Compute the rolling Absorption Ratio.
@@ -108,14 +110,24 @@ def compute_absorption_ratio(
     Parameters
     ----------
     returns : T × N return DataFrame
-    window : rolling estimation window
-    min_periods : minimum observations
+    window : rolling estimation window (used for fallback rolling corr when lam=None)
+    min_periods : minimum observations before computing
     variance_fraction : fraction of variance for numerator (Kritzman et al. use 1/5)
     winsorize : clip returns at ±N sigma
+    lam : EWMA decay factor for FastCovariance (FAST track).
+        If None, falls back to rolling sample correlation (legacy method).
+        Default 0.94 (RiskMetrics). EWMA R_t reacts faster to correlation
+        regime changes, providing a lead over the rolling estimator at crisis onset.
 
     Returns
     -------
     AbsorptionResult
+
+    Notes
+    -----
+    AR_t = sum_{i=1}^{k} lambda_i / sum_{i=1}^{N} lambda_i
+    With lam is not None: eigendecomposition of EWMA R_t from FastCovariance.
+    With lam=None: eigendecomposition of rolling sample correlation matrix.
     """
     returns = clean_returns(returns, winsorize_sigma=winsorize if winsorize > 0 else None)
     T, N = returns.shape
@@ -123,6 +135,8 @@ def compute_absorption_ratio(
 
     ar_values = np.full(T, np.nan)
     top_eigs = np.full((T, min(3, N)), np.nan)
+
+    _fast_cov = FastCovariance() if lam is not None else None
 
     for i in range(T):
         if i < min_periods:
@@ -134,7 +148,14 @@ def compute_absorption_ratio(
             continue
 
         try:
-            corr_matrix = window_data.corr().values
+            if lam is not None:
+                # FAST track: EWMA correlation matrix
+                cov_result = _fast_cov.fit(window_data, lam=lam)
+                corr_matrix = cov_result.R_t
+            else:
+                # Legacy: rolling sample correlation
+                corr_matrix = window_data.corr().values
+
             if np.any(np.isnan(corr_matrix)):
                 continue
             ar, eigs = _compute_ar(corr_matrix, variance_fraction)

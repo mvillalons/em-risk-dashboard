@@ -48,6 +48,7 @@ from core.returns import (
     log_returns,
     CovMethod,
 )
+from core.covariance import SlowCovariance, VolStandardizer
 
 
 # ---------------------------------------------------------------------------
@@ -209,24 +210,26 @@ def compute_turbulence_index(
     regime_thresholds: Tuple[float, float, float] = (0.75, 0.90, 0.95),
     winsorize: float = 5.0,
     use_log: bool = True,
+    vol_standardize: bool = True,
+    slow_window: int = 504,
 ) -> TurbulenceResult:
     """
     Compute the rolling Turbulence Index (Kritzman & Li, 2010).
 
     The turbulence score at time t is the squared Mahalanobis distance of the
     current return vector r_t from the historical mean, scaled by the inverse
-    covariance matrix estimated on the trailing `window` observations.
+    covariance matrix estimated on the trailing `slow_window` observations.
 
     Parameters
     ----------
     returns : pd.DataFrame
         T × N DataFrame of returns (log or simple). Dates as index.
     window : int
-        Rolling window for estimating μ and Σ. Default 252 (1 trading year).
+        Kept for backward compatibility; slow_window governs covariance lookback.
     min_periods : int
         Minimum observations before computing. Default 60.
     method : CovMethod
-        Covariance estimator: 'ledoit_wolf' (default), 'oas', 'sample', 'ewm'.
+        Legacy parameter; SlowCovariance always uses Ledoit-Wolf.
     regime_thresholds : tuple of 3 floats
         Percentile cutoffs for (Elevated, Turbulent, Crisis) regimes.
         Applied to the full history of turbulence scores.
@@ -234,6 +237,12 @@ def compute_turbulence_index(
         Winsorize returns at ±N standard deviations. Set 0 to disable.
     use_log : bool
         Whether to use log(τ) for regime classification. Raw τ for display.
+    vol_standardize : bool
+        If True, pre-whiten returns with EWMA vol (VolStandardizer, lam=0.94)
+        before Mahalanobis computation. Suppresses pure vol spikes; tau then
+        measures correlation anomalies rather than magnitude spikes.
+    slow_window : int
+        Lookback for SlowCovariance (Ledoit-Wolf). Default 504 (2 trading years).
 
     Returns
     -------
@@ -242,12 +251,9 @@ def compute_turbulence_index(
 
     Notes
     -----
-    For N assets, τ_t ~ χ²(N) under Gaussian returns. This gives a clean
-    statistical interpretation: a score at the 95th percentile of χ²(N) means
-    the return vector would occur only 5% of the time if markets were normal.
-
-    The Mahalanobis decomposition (magnitude vs. correlation) is non-standard
-    but highly diagnostic: correlation breaks are the hallmark of systemic crises.
+    τ_t = (r_t - μ)' Σ⁻¹ (r_t - μ)
+    When vol_standardize=True, r_t → D_t^{-1/2} r_t before this formula.
+    For N assets, τ_t ~ χ²(N) under Gaussian returns.
     """
     # --- Input validation and cleaning ---
     if not isinstance(returns, pd.DataFrame):
@@ -261,27 +267,36 @@ def compute_turbulence_index(
     if T < min_periods:
         raise ValueError(f"Insufficient data: {T} obs, need at least {min_periods}")
 
-    # --- Rolling computation ---
+    # --- Vol standardization (SLOW-track pre-whitening) ---
+    if vol_standardize:
+        input_returns = VolStandardizer().fit_transform(returns, lam=0.94).fillna(0.0)
+    else:
+        input_returns = returns
+
+    # --- Rolling computation (SLOW-track covariance) ---
     tau_values = np.full(T, np.nan)
     mag_values = np.full(T, np.nan)
     corr_values = np.full(T, np.nan)
+
+    _slow_cov = SlowCovariance()
 
     for i in range(T):
         if i < min_periods:
             continue
 
-        # Rolling window (expanding until we hit `window`)
-        start_i = max(0, i - window)
-        window_data = returns.iloc[start_i:i]  # exclude current observation
+        # Rolling window — expanding until we reach slow_window
+        start_i = max(0, i - slow_window)
+        window_data = input_returns.iloc[start_i:i]  # exclude current observation
 
         if len(window_data) < min_periods:
             continue
 
         try:
-            mu, sigma = estimate_covariance(window_data, method=method)
-            sigma_inv = pseudo_inverse(sigma)
+            cov_result = _slow_cov.fit(window_data, window=slow_window)
+            mu = cov_result.mu
+            sigma_inv = cov_result.sigma_inv
 
-            r_t = returns.iloc[i].values
+            r_t = input_returns.iloc[i].values
             tau = _mahalanobis_sq(r_t, mu, sigma_inv)
             tau_mag, tau_corr = _decompose_mahalanobis(r_t, mu, sigma_inv)
 
