@@ -37,11 +37,15 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.covariance import FastCovariance, KalmanCorrelation
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +73,7 @@ class RollingPCAResult:
     window: int
     n_components: int
     asset_names: list[str]
+    innovation_norm: pd.Series = field(default_factory=pd.Series)  # ||R_hat_t - R_{t|t-1}||_F
 
     def dominant_factor_exposure(self, country: str) -> pd.Series:
         """Rolling exposure (loading) of `country` to Factor 1."""
@@ -176,6 +181,7 @@ def compute_rolling_pca(
     min_periods: int = 60,
     snapshot_freq: int = 21,    # Save loading snapshot every N days (for history)
     standardize: bool = True,
+    R_t_series: Optional[List[np.ndarray]] = None,
 ) -> RollingPCAResult:
     """
     Rolling PCA on the return panel.
@@ -196,6 +202,10 @@ def compute_rolling_pca(
     min_periods : minimum obs before computing
     snapshot_freq : save loading snapshot every N periods (for loading evolution)
     standardize : whether to scale columns to unit variance before PCA
+    R_t_series : optional list of T N×N correlation matrices.
+        If provided, eigendecompose R_t_series[i] directly instead of computing
+        sample correlation from the window. Returns are still used for factor
+        score projection (current observation projected onto eigenvectors).
 
     Returns
     -------
@@ -234,7 +244,20 @@ def compute_rolling_pca(
             x_now = returns.iloc[i:i+1].values
 
         try:
-            _, loadings, explained_var, eigenvalues = _pca_window(X, K)
+            if R_t_series is not None:
+                # Use provided correlation matrix: eigendecompose directly
+                R_i = R_t_series[i]
+                eigvals, eigvecs = np.linalg.eigh(R_i)
+                # eigh returns ascending order; reverse for descending
+                eigvals = eigvals[::-1]
+                eigvecs = eigvecs[:, ::-1]
+                eigvals = np.maximum(eigvals, 0.0)
+                total_var = eigvals.sum()
+                explained_var = (eigvals[:K] / (total_var + 1e-12))
+                eigenvalues = eigvals[:K]
+                loadings = eigvecs[:, :K]    # N × K
+            else:
+                _, loadings, explained_var, eigenvalues = _pca_window(X, K)
 
             # Project current observation onto loadings
             x_demeaned = x_now - X.mean(axis=0)
@@ -481,6 +504,114 @@ def compute_dynamic_factors(
     composite_stress.name = "composite_stress"
 
     # Factor regime flags
+    factor_regime_flags = pca_result.factor_regime(threshold_sigma=1.5)
+
+    return DynamicFactorResult(
+        pca=pca_result,
+        kalman=kalman_results,
+        composite_stress=composite_stress,
+        factor_regime_flags=factor_regime_flags,
+    )
+
+
+# ---------------------------------------------------------------------------
+# V2: Kalman filter on R_t (not factor scores)
+# ---------------------------------------------------------------------------
+
+def compute_dynamic_factors_v2(
+    returns: pd.DataFrame,
+    window: int = 252,
+    n_components: int = 3,
+    min_periods: int = 60,
+    lam: float = 0.94,
+    q_scale: float = 0.01,
+    kalman_auto_tune: bool = True,
+    snapshot_freq: int = 21,
+    standardize: bool = True,
+) -> DynamicFactorResult:
+    """
+    Full pipeline v2: FastCovariance EWMA R_t → KalmanCorrelation → Rolling PCA
+    → Kalman Filter on factor scores → Composite Stress Index.
+
+    Differences from v1:
+    - Correlation matrix is EWMA-based (FastCovariance, lam=0.94) instead of
+      rolling sample correlation inside PCA.
+    - KalmanCorrelation smooths R_hat_t → smoothed R_t (latent correlation state).
+    - compute_rolling_pca uses the smoothed R_t via R_t_series parameter.
+    - RollingPCAResult.innovation_norm is populated with ||R_hat_t - R_{t|t-1}||_F.
+
+    Parameters
+    ----------
+    returns : T × N return DataFrame
+    window : rolling window passed to compute_rolling_pca (for window_data stats)
+    n_components : number of latent factors
+    min_periods : minimum observations before computation
+    lam : EWMA decay factor for FastCovariance
+    q_scale : process noise scale for KalmanCorrelation
+    kalman_auto_tune : estimate Kalman parameters from data for factor score filter
+    snapshot_freq : frequency of loading snapshots (days)
+    standardize : standardize columns before PCA
+
+    Returns
+    -------
+    DynamicFactorResult with pca.innovation_norm populated.
+
+    Notes
+    -----
+    innovation_norm[t] = ||R_hat_t - R_{t|t-1}||_F
+    Large values signal rapid correlation regime transitions.
+    """
+    from core.returns import clean_returns
+    returns_clean = returns.ffill(limit=3).fillna(0.0)
+
+    # Stage 1: Get EWMA R_hat_t series for every date
+    R_hat_series = FastCovariance().fit_rolling(returns_clean, lam=lam)
+
+    # Stage 2: Kalman filter on R_hat_series → smoothed R_t + innovation norms
+    kalman_corr_result = KalmanCorrelation().fit(R_hat_series, q_scale=q_scale)
+    filtered_R = kalman_corr_result.filtered_R
+    inno_norms = kalman_corr_result.innovations_norm
+
+    # Stage 3: Rolling PCA using smoothed R_t
+    pca_result = compute_rolling_pca(
+        returns_clean,
+        window=window,
+        n_components=n_components,
+        min_periods=min_periods,
+        snapshot_freq=snapshot_freq,
+        standardize=standardize,
+        R_t_series=filtered_R,
+    )
+
+    # Attach innovation_norm as a pd.Series on the PCA result
+    pca_result.innovation_norm = pd.Series(
+        inno_norms, index=returns_clean.index, name="innovation_norm"
+    )
+
+    # Stage 4: Kalman filter on each factor score (same as v1)
+    kalman_results = {}
+    for k in range(pca_result.n_components):
+        fname = f"F{k+1}"
+        fs = pca_result.factor_scores[fname]
+        kf = kalman_filter_local_level(fs, auto_tune=kalman_auto_tune)
+        kalman_results[fname] = kf
+
+    # Stage 5: Composite stress index (variance-weighted, same as v1)
+    ev = pca_result.explained_variance.rolling(window, min_periods=30).mean()
+    composite_parts = []
+    weights_used = []
+    for k in range(pca_result.n_components):
+        fname = f"F{k+1}"
+        kf_filtered = kalman_results[fname].filtered
+        weight = ev[fname].fillna(1.0 / pca_result.n_components)
+        composite_parts.append(kf_filtered.abs() * weight)
+        weights_used.append(weight)
+
+    composite_stress = sum(composite_parts)
+    if composite_stress is not int:
+        composite_stress = composite_stress / (sum(weights_used) + 1e-12)
+    composite_stress.name = "composite_stress"
+
     factor_regime_flags = pca_result.factor_regime(threshold_sigma=1.5)
 
     return DynamicFactorResult(
