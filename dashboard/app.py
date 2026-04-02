@@ -34,6 +34,12 @@ from modules.turbulence import compute_turbulence_index, crisis_episodes, REGIME
 from modules.absorption import compute_absorption_ratio
 from modules.pca_kalman import compute_dynamic_factors_v2
 from data.synthetic import generate_em_universe, get_regime_series
+from core.metric_cache import (
+    exists, make_key,
+    save_turbulence, load_turbulence,
+    save_absorption, load_absorption,
+    save_dynamic,    load_dynamic,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -181,107 +187,135 @@ def load_raw_data(data_mode: str, start: str, end: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Cached layer 2: Turbulence metrics (no TTL)
+# Metric layer 2: Turbulence  (disk cache — survives Streamlit restarts)
 # Cache key: data_key + window + vol_standardize
 # lam is NOT in the key — moving the lam slider will NOT bust this cache.
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Computing turbulence...")
-def compute_turbulence_metrics(
+def get_turbulence_metrics(
     data_key: str,
     window: int,
     vol_standardize: bool,
-    *,
-    _raw: dict,
+    raw: dict,
 ) -> dict:
     """
-    Compute all turbulence-related metrics.
+    Return turbulence metrics, loading from disk cache when available.
+
+    Cache key encodes data_key + window + vol_standardize only.
+    Changing lam will NOT bust this cache.
 
     Parameters
     ----------
-    data_key       : md5 hex digest of panel parquet bytes — controls cache
-                     invalidation without hashing the full DataFrame on every call
+    data_key       : 16-char md5 of panel hash
     window         : rolling estimation window (trading days)
-    vol_standardize: whether to pre-whiten returns with EWMA vol
-    _raw           : raw data dict from load_raw_data (underscore prefix →
-                     Streamlit skips hashing this arg; data_key covers it)
+    vol_standardize: EWMA vol pre-whitening toggle
+    raw            : dict from load_raw_data
 
     Returns
     -------
     dict with keys: turb_panel, turb_fx, turb_eq, country_turb
     """
-    fx_ret = _raw["fx_ret"]
-    eq_ret = _raw["eq_ret"]
-    panel  = _raw["panel"]
-    slow_w = max(window, 252)
+    vs = int(vol_standardize)
+    fx_ret = raw["fx_ret"]
+    eq_ret = raw["eq_ret"]
+    panel  = raw["panel"]
 
-    turb_fx = compute_turbulence_index(
-        fx_ret, window=window, min_periods=60,
-        vol_standardize=vol_standardize, slow_window=slow_w,
-    )
-    turb_eq = compute_turbulence_index(
-        eq_ret, window=window, min_periods=60,
-        vol_standardize=vol_standardize, slow_window=slow_w,
-    )
-    turb_panel = compute_turbulence_index(
-        panel, window=window, min_periods=60,
-        vol_standardize=vol_standardize, slow_window=slow_w,
-    )
+    keys = {
+        "panel": make_key("turb_panel", data_key, window, vs),
+        "fx":    make_key("turb_fx",    data_key, window, vs),
+        "eq":    make_key("turb_eq",    data_key, window, vs),
+        **{c:    make_key("turb", c, data_key, window, vs) for c in fx_ret.columns},
+    }
 
-    country_turb: dict = {}
-    for col in fx_ret.columns:
-        paired_eq_col = list(eq_ret.columns)[list(fx_ret.columns).index(col)]
-        ct = compute_turbulence_index(
-            pd.concat([fx_ret[[col]], eq_ret[[paired_eq_col]]], axis=1),
-            window=window, min_periods=60,
-            vol_standardize=vol_standardize, slow_window=slow_w,
-        )
-        country_turb[col] = ct
+    if all(exists(k) for k in keys.values()):
+        return {
+            "turb_panel":   load_turbulence(keys["panel"]),
+            "turb_fx":      load_turbulence(keys["fx"]),
+            "turb_eq":      load_turbulence(keys["eq"]),
+            "country_turb": {c: load_turbulence(keys[c]) for c in fx_ret.columns},
+        }
+
+    # Cache miss — compute all turbulence metrics and persist.
+    with st.spinner("Computing turbulence metrics..."):
+        slow_w = max(window, 252)
+        kw = dict(window=window, min_periods=60,
+                  vol_standardize=vol_standardize, slow_window=slow_w)
+
+        turb_panel = compute_turbulence_index(panel,  **kw)
+        turb_fx    = compute_turbulence_index(fx_ret, **kw)
+        turb_eq    = compute_turbulence_index(eq_ret, **kw)
+
+        cols_fx = list(fx_ret.columns)
+        cols_eq = list(eq_ret.columns)
+        country_turb: dict = {}
+        for i, col in enumerate(cols_fx):
+            ct = pd.concat([fx_ret[[col]], eq_ret[[cols_eq[i]]]], axis=1)
+            country_turb[col] = compute_turbulence_index(ct, **kw)
+
+        save_turbulence(keys["panel"], turb_panel)
+        save_turbulence(keys["fx"],    turb_fx)
+        save_turbulence(keys["eq"],    turb_eq)
+        for col in cols_fx:
+            save_turbulence(keys[col], country_turb[col])
 
     return {
+        "turb_panel":   turb_panel,
         "turb_fx":      turb_fx,
         "turb_eq":      turb_eq,
-        "turb_panel":   turb_panel,
         "country_turb": country_turb,
     }
 
 
 # ---------------------------------------------------------------------------
-# Cached layer 3: Fragility metrics (no TTL)
+# Metric layer 3: Fragility  (disk cache — survives Streamlit restarts)
 # Cache key: data_key + window + lam
 # vol_standardize is NOT in the key — toggling it will NOT bust this cache.
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Computing fragility metrics...")
-def compute_fragility_metrics(
+def get_fragility_metrics(
     data_key: str,
     window: int,
     lam: float,
-    *,
-    _raw: dict,
+    raw: dict,
 ) -> dict:
     """
-    Compute Absorption Ratio and Dynamic Factor (KalmanCorrelation) metrics.
+    Return fragility metrics (AR + dynamic factors), loading from disk cache
+    when available.
+
+    Cache key encodes data_key + window + lam only.
+    Changing vol_standardize will NOT bust this cache.
 
     Parameters
     ----------
-    data_key : md5 hex digest of panel parquet bytes
+    data_key : 16-char md5 of panel hash
     window   : rolling estimation window (trading days)
-    lam      : EWMA decay lambda for FastCovariance (0.90–0.99)
-    _raw     : raw data dict from load_raw_data (not hashed by Streamlit)
+    lam      : EWMA decay lambda (0.90–0.99); stored as int(lam*100) in key
+    raw      : dict from load_raw_data
 
     Returns
     -------
     dict with keys: ar_fx, dyn
     """
-    fx_ret = _raw["fx_ret"]
-    panel  = _raw["panel"]
+    lam_int = int(round(lam * 100))
+    key_ar  = make_key("ar",  data_key, window, lam_int)
+    key_dyn = make_key("dyn", data_key, window, lam_int)
 
-    ar_fx = compute_absorption_ratio(fx_ret, window=window, min_periods=60, lam=lam)
+    if exists(key_ar) and exists(key_dyn):
+        return {
+            "ar_fx": load_absorption(key_ar),
+            "dyn":   load_dynamic(key_dyn),
+        }
 
-    dyn = compute_dynamic_factors_v2(
-        panel, window=window, n_components=3, min_periods=60, lam=lam,
-    )
+    # Cache miss — compute and persist.
+    with st.spinner("Computing fragility metrics..."):
+        ar_fx = compute_absorption_ratio(
+            raw["fx_ret"], window=window, min_periods=60, lam=lam,
+        )
+        dyn = compute_dynamic_factors_v2(
+            raw["panel"], window=window, n_components=3, min_periods=60, lam=lam,
+        )
+        save_absorption(key_ar,  ar_fx)
+        save_dynamic(key_dyn, dyn)
 
     return {
         "ar_fx": ar_fx,
@@ -341,8 +375,8 @@ panel    = raw["panel"]
 _panel_hash = pd.util.hash_pandas_object(panel, index=True).sum()
 data_key    = hashlib.md5(str(_panel_hash).encode()).hexdigest()[:16]
 
-turb      = compute_turbulence_metrics(data_key, window, vol_standardize, _raw=raw)
-fragility = compute_fragility_metrics(data_key, window, lam, _raw=raw)
+turb      = get_turbulence_metrics(data_key, window, vol_standardize, raw)
+fragility = get_fragility_metrics(data_key, window, lam, raw)
 
 
 # ---------------------------------------------------------------------------
