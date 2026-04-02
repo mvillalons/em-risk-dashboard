@@ -200,12 +200,55 @@ def load_em_universe(
     result = {}
 
     if include_fx:
-        fx_tickers = ["CLPUSD=X", "BRL=X", "MXN=X", "COP=X", "PEN=X"]
-        fx_names = ["CLP", "BRL", "MXN", "COP", "PEN"]
-        df_fx = fetch_yfinance(fx_tickers, start=start, use_cache=use_cache)
-        df_fx.columns = fx_names
-        # CLP is quoted as USD/CLP; invert so all series = local currency per USD
-        # CLPUSD=X already gives CLP per USD in practice — verify on actual data
+        # Fetch each FX ticker individually to avoid yfinance alphabetical column
+        # reordering in multi-ticker downloads.  All series stored as local CCY per USD.
+        #
+        # Ticker notes:
+        #   CLPUSD=X  → USD per CLP  (invert to get CLP per USD, expected ~600-1100)
+        #   USDBRL=X  → BRL per USD  (direct,  expected ~2.5-6.5)
+        #   USDMXN=X  → MXN per USD  (direct,  expected ~13-22)
+        #   USDCOP=X  → COP per USD  (direct,  expected ~1800-5000)
+        #   PEN=X     → PEN per USD  (direct,  expected ~2.5-4.5)
+        fx_spec: list[tuple[str, str, bool]] = [
+            ("CLPUSD=X", "CLP", True),   # invert: 1/raw
+            ("USDBRL=X", "BRL", False),
+            ("USDMXN=X", "MXN", False),
+            ("USDCOP=X", "COP", False),
+            ("PEN=X",    "PEN", False),
+        ]
+
+        FX_RANGES: dict[str, tuple[float, float]] = {
+            "CLP": (500.0,  1200.0),
+            "BRL": (2.0,    8.0),
+            "MXN": (10.0,   25.0),
+            "COP": (1500.0, 6000.0),
+            "PEN": (2.5,    4.5),
+        }
+
+        fx_frames: list[pd.Series] = []
+        for ticker, name, invert in fx_spec:
+            raw_df = fetch_yfinance([ticker], start=start, use_cache=use_cache)
+            s = raw_df.iloc[:, 0].copy()
+            if invert:
+                s = (1.0 / s.replace(0.0, float("nan"))).ffill(limit=3)
+            else:
+                s = s.ffill(limit=3)
+            s.name = name
+
+            # Range sanity check on most-recent valid observation
+            last_valid = s.dropna()
+            if not last_valid.empty:
+                latest = float(last_valid.iloc[-1])
+                lo, hi = FX_RANGES[name]
+                if not (lo <= latest <= hi):
+                    logger.warning(
+                        "FX sanity check failed: %s latest=%.4f expected [%.1f, %.1f]",
+                        name, latest, lo, hi,
+                    )
+
+            fx_frames.append(s)
+
+        df_fx = pd.concat(fx_frames, axis=1)
         result["fx"] = df_fx
 
     if include_equity:
