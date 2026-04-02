@@ -5,10 +5,19 @@ EM Risk Dashboard — Streamlit Application
 ==============================
 
 Run with: streamlit run dashboard/app.py
+
+Caching architecture (three independent layers):
+  load_raw_data          ttl=12h   key: data_mode + start + end
+  compute_turbulence_metrics  no ttl   key: data_key + window + vol_standardize
+  compute_fragility_metrics   no ttl   key: data_key + window + lam
+Moving the lam slider recomputes ONLY fragility (~3s).
+Toggling vol_standardize recomputes ONLY turbulence (~2s).
 """
 
+import hashlib
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -115,23 +124,33 @@ div[data-testid="stSidebar"] { background: #080d12; }
 
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Cached layer 1: Raw data (TTL = 12 h)
+# Cache key: data_mode + start + end  — no metric params here
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=3600, show_spinner="Loading market data...")
-def load_data(
-    data_mode: str,
-    start: str,
-    end: str,
-    window: int,
-    lam: float,
-    vol_standardize: bool,
-):
+@st.cache_data(ttl=43200, show_spinner="Fetching market data...")
+def load_raw_data(data_mode: str, start: str, end: str) -> dict:
+    """
+    Load raw price levels and log-returns.  No metric computation.
+
+    Parameters
+    ----------
+    data_mode : "Synthetic" or "Live"
+    start     : start date string 'YYYY-MM-DD'
+    end       : end date string   'YYYY-MM-DD' (used for synthetic only)
+
+    Returns
+    -------
+    dict with keys: fx_ret, eq_ret, panel, prices_fx, prices_eq,
+                    data_mode (actual), last_updated (UTC timestamp)
+    """
+    actual_mode = data_mode
+
     if data_mode == "Live":
         try:
             from data.fetcher import load_em_universe
             from core.returns import log_returns
-            raw = load_em_universe(start=start)
+            raw        = load_em_universe(start=start)
             fx_ret     = log_returns(raw["fx"])
             eq_ret     = log_returns(raw["equity"])
             global_ret = log_returns(raw["global"])
@@ -140,9 +159,9 @@ def load_data(
             prices_eq  = raw["equity"]
         except Exception as e:
             st.warning(f"Live fetch failed ({e}), using synthetic data.")
-            data_mode = "Synthetic"
+            actual_mode = "Synthetic"
 
-    if data_mode == "Synthetic":
+    if actual_mode == "Synthetic":
         uni       = generate_em_universe(start=start, end=end, seed=42)
         fx_ret    = uni.fx
         eq_ret    = uni.equity
@@ -150,52 +169,123 @@ def load_data(
         prices_fx = uni.prices_fx
         prices_eq = uni.prices_eq
 
-    # Turbulence indices — pass lam and vol_standardize through
-    turb_fx = compute_turbulence_index(
-        fx_ret, window=window, min_periods=60,
-        vol_standardize=vol_standardize, slow_window=max(window, 252),
-    )
-    turb_eq = compute_turbulence_index(
-        eq_ret, window=window, min_periods=60,
-        vol_standardize=vol_standardize, slow_window=max(window, 252),
-    )
-    turb_panel = compute_turbulence_index(
-        panel, window=window, min_periods=60,
-        vol_standardize=vol_standardize, slow_window=max(window, 252),
-    )
-
-    # Absorption Ratio — EWMA track with user-selected lam
-    ar_fx = compute_absorption_ratio(fx_ret, window=window, min_periods=60, lam=lam)
-
-    # Dynamic factors v2 — KalmanCorrelation on panel
-    dyn = compute_dynamic_factors_v2(
-        panel, window=window, n_components=3, min_periods=60, lam=lam,
-    )
-
-    # Per-country turbulence (FX + paired equity column)
-    country_turb = {}
-    for col in fx_ret.columns:
-        paired_eq_col = list(eq_ret.columns)[list(fx_ret.columns).index(col)]
-        ct = compute_turbulence_index(
-            pd.concat([fx_ret[[col]], eq_ret[[paired_eq_col]]], axis=1),
-            window=window, min_periods=60,
-            vol_standardize=vol_standardize, slow_window=max(window, 252),
-        )
-        country_turb[col] = ct
-
     return {
         "fx_ret":       fx_ret,
         "eq_ret":       eq_ret,
         "panel":        panel,
         "prices_fx":    prices_fx,
         "prices_eq":    prices_eq,
+        "data_mode":    actual_mode,
+        "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cached layer 2: Turbulence metrics (no TTL)
+# Cache key: data_key + window + vol_standardize
+# lam is NOT in the key — moving the lam slider will NOT bust this cache.
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner="Computing turbulence...")
+def compute_turbulence_metrics(
+    data_key: str,
+    window: int,
+    vol_standardize: bool,
+    *,
+    _raw: dict,
+) -> dict:
+    """
+    Compute all turbulence-related metrics.
+
+    Parameters
+    ----------
+    data_key       : md5 hex digest of panel parquet bytes — controls cache
+                     invalidation without hashing the full DataFrame on every call
+    window         : rolling estimation window (trading days)
+    vol_standardize: whether to pre-whiten returns with EWMA vol
+    _raw           : raw data dict from load_raw_data (underscore prefix →
+                     Streamlit skips hashing this arg; data_key covers it)
+
+    Returns
+    -------
+    dict with keys: turb_panel, turb_fx, turb_eq, country_turb
+    """
+    fx_ret = _raw["fx_ret"]
+    eq_ret = _raw["eq_ret"]
+    panel  = _raw["panel"]
+    slow_w = max(window, 252)
+
+    turb_fx = compute_turbulence_index(
+        fx_ret, window=window, min_periods=60,
+        vol_standardize=vol_standardize, slow_window=slow_w,
+    )
+    turb_eq = compute_turbulence_index(
+        eq_ret, window=window, min_periods=60,
+        vol_standardize=vol_standardize, slow_window=slow_w,
+    )
+    turb_panel = compute_turbulence_index(
+        panel, window=window, min_periods=60,
+        vol_standardize=vol_standardize, slow_window=slow_w,
+    )
+
+    country_turb: dict = {}
+    for col in fx_ret.columns:
+        paired_eq_col = list(eq_ret.columns)[list(fx_ret.columns).index(col)]
+        ct = compute_turbulence_index(
+            pd.concat([fx_ret[[col]], eq_ret[[paired_eq_col]]], axis=1),
+            window=window, min_periods=60,
+            vol_standardize=vol_standardize, slow_window=slow_w,
+        )
+        country_turb[col] = ct
+
+    return {
         "turb_fx":      turb_fx,
         "turb_eq":      turb_eq,
         "turb_panel":   turb_panel,
-        "ar_fx":        ar_fx,
-        "dyn":          dyn,
         "country_turb": country_turb,
-        "data_mode":    data_mode,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cached layer 3: Fragility metrics (no TTL)
+# Cache key: data_key + window + lam
+# vol_standardize is NOT in the key — toggling it will NOT bust this cache.
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner="Computing fragility metrics...")
+def compute_fragility_metrics(
+    data_key: str,
+    window: int,
+    lam: float,
+    *,
+    _raw: dict,
+) -> dict:
+    """
+    Compute Absorption Ratio and Dynamic Factor (KalmanCorrelation) metrics.
+
+    Parameters
+    ----------
+    data_key : md5 hex digest of panel parquet bytes
+    window   : rolling estimation window (trading days)
+    lam      : EWMA decay lambda for FastCovariance (0.90–0.99)
+    _raw     : raw data dict from load_raw_data (not hashed by Streamlit)
+
+    Returns
+    -------
+    dict with keys: ar_fx, dyn
+    """
+    fx_ret = _raw["fx_ret"]
+    panel  = _raw["panel"]
+
+    ar_fx = compute_absorption_ratio(fx_ret, window=window, min_periods=60, lam=lam)
+
+    dyn = compute_dynamic_factors_v2(
+        panel, window=window, n_components=3, min_periods=60, lam=lam,
+    )
+
+    return {
+        "ar_fx": ar_fx,
+        "dyn":   dyn,
     }
 
 
@@ -237,35 +327,51 @@ with st.sidebar:
     show_inorm   = st.checkbox("Show Correlation Regime Shock", value=True)
     show_heatmap = st.checkbox("Show correlation heatmap", value=True)
 
-    st.markdown("---")
-    st.caption("EM Risk Dashboard v0.2 · Prototype")
+
+# ---------------------------------------------------------------------------
+# Load and compute (three cached layers)
+# ---------------------------------------------------------------------------
+
+raw      = load_raw_data(data_mode, str(start_date), str(end_date))
+panel    = raw["panel"]
+
+# Compact hash of panel content — used as cache key for metric layers without
+# hashing the full DataFrame on every Streamlit re-render.
+# pd.util.hash_pandas_object is faster and avoids serialization overhead.
+_panel_hash = pd.util.hash_pandas_object(panel, index=True).sum()
+data_key    = hashlib.md5(str(_panel_hash).encode()).hexdigest()[:16]
+
+turb      = compute_turbulence_metrics(data_key, window, vol_standardize, _raw=raw)
+fragility = compute_fragility_metrics(data_key, window, lam, _raw=raw)
 
 
 # ---------------------------------------------------------------------------
-# Load data
+# Sidebar cache status (appended after data is available)
 # ---------------------------------------------------------------------------
 
-data = load_data(
-    data_mode=data_mode,
-    start=str(start_date),
-    end=str(end_date),
-    window=window,
-    lam=lam,
-    vol_standardize=vol_standardize,
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    f"📊 Data: {raw['last_updated']}\n\n"
+    f"Cache key: `{data_key}`"
 )
+st.sidebar.caption("EM Risk Dashboard v0.2 · Prototype")
 
+
+# ---------------------------------------------------------------------------
 # Resolve active turbulence result
+# ---------------------------------------------------------------------------
+
 signal_map = {
     "FX Returns":                           "turb_fx",
     "Equity Returns":                       "turb_eq",
     "Full Panel (FX + Equity + Global)":    "turb_panel",
 }
-active_turb = data[signal_map[signal_layer]]
-ar          = data["ar_fx"]
-dyn         = data["dyn"]
-fx_ret      = data["fx_ret"]
-eq_ret      = data["eq_ret"]
-actual_mode = data["data_mode"]
+active_turb = turb[signal_map[signal_layer]]
+ar          = fragility["ar_fx"]
+dyn         = fragility["dyn"]
+fx_ret      = raw["fx_ret"]
+eq_ret      = raw["eq_ret"]
+actual_mode = raw["data_mode"]
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +456,7 @@ cc = st.columns(5)
 
 countries = list(COUNTRY_NAMES.keys())
 for i, ctry in enumerate(countries):
-    ct     = data["country_turb"][ctry]
+    ct     = turb["country_turb"][ctry]
     score  = ct.current_score()
     pctile = ct.current_pctile()
     regime = ct.current_regime()
@@ -718,7 +824,7 @@ st.markdown("#### Price Levels (rebased to 100)")
 col_px1, col_px2 = st.columns(2)
 
 with col_px1:
-    prices_fx  = data["prices_fx"]
+    prices_fx  = raw["prices_fx"]
     fig_fx     = go.Figure()
     colors_fx  = [ACCENT, "#e74c3c", "#f39c12", "#9b59b6", "#3498db"]
     for i, col in enumerate(prices_fx.columns):
@@ -739,7 +845,7 @@ with col_px1:
     st.plotly_chart(fig_fx, use_container_width=True)
 
 with col_px2:
-    prices_eq = data["prices_eq"]
+    prices_eq = raw["prices_eq"]
     fig_eq    = go.Figure()
     for i, col in enumerate(prices_eq.columns):
         fig_eq.add_trace(go.Scatter(
