@@ -23,7 +23,9 @@ em_risk_dashboard/
 │   └── universe.yaml
 ├── core/
 │   ├── __init__.py
-│   └── returns.py
+│   ├── returns.py
+│   ├── covariance.py
+│   └── metric_cache.py
 ├── data/
 │   ├── __init__.py
 │   ├── fetcher.py
@@ -37,9 +39,18 @@ em_risk_dashboard/
 ├── dashboard/
 │   ├── __init__.py
 │   └── app.py
+├── notebooks/
+│   ├── 01_data_validation.ipynb   — live data quality and price verification
+│   ├── 02_turbulence_audit.ipynb  — manual tau replication and chi2(N) calibration
+│   ├── 03_factor_structure.ipynb  — PCA loadings and Kalman innovation analysis
+│   ├── 04_regime_analysis.ipynb   — transition matrices and country ranking
+│   └── 05_methodology_sandbox.ipynb — DCC-GARCH and new metric development
+├── scripts/
+│   └── export_audit.py
 └── tests/
     ├── __init__.py
-    └── test_turbulence.py
+    ├── test_turbulence.py
+    └── test_covariance.py
 ```
 
 ---
