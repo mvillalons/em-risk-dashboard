@@ -40,10 +40,11 @@ em_risk_dashboard/
 │   ├── __init__.py
 │   └── app.py
 ├── notebooks/
+│   ├── 00_master.ipynb            — daily monitoring, reads from cache, runs in <10s, exports to Excel. Primary daily entry point.
 │   ├── 01_data_validation.ipynb   — live data quality and price verification
-│   ├── 02_turbulence_audit.ipynb  — manual tau replication and chi2(N) calibration
-│   ├── 03_factor_structure.ipynb  — PCA loadings and Kalman innovation analysis
-│   ├── 04_regime_analysis.ipynb   — transition matrices and country ranking
+│   ├── 02_turbulence_audit.ipynb  — manual tau replication and chi2(N) calibration (ipywidgets params)
+│   ├── 03_factor_structure.ipynb  — PCA loadings and Kalman innovation analysis (ipywidgets params)
+│   ├── 04_regime_analysis.ipynb   — transition matrices and country ranking (ipywidgets params)
 │   └── 05_methodology_sandbox.ipynb — DCC-GARCH and new metric development
 ├── scripts/
 │   └── export_audit.py
@@ -125,6 +126,8 @@ Done and tested:
 - dashboard/app.py (lam slider, vol-std toggle, data radio, ||ΔR||_F chart)
 - tests/test_covariance.py, tests/test_turbulence.py
 - scripts/export_audit.py (Session 6)
+- data/metric_store.py (MetricStore read wrapper over parquet cache)
+- notebooks/00_master.ipynb through 05 (with Excel exports + ipywidgets in 02-04)
 
 NOT done:
 - DCC-GARCH (deferred)

@@ -25,3 +25,6 @@ notebooks/**/.ipynb_checkpoints/
 
 # Audit export artefacts
 audit_exports/
+
+# Daily snapshot Excel exports
+exports/
